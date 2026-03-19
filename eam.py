@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +52,52 @@ def target_config_path(cli_value: str | None) -> Path:
     if cli_value:
         return Path(cli_value).expanduser()
     return Path.home() / ".config" / "eam" / "servers.yaml"
+
+
+def default_cache_dir() -> Path:
+    if os.environ.get("EAM_CACHE_DIR"):
+        return Path(os.environ["EAM_CACHE_DIR"]).expanduser()
+    if os.environ.get("XDG_CACHE_HOME"):
+        return Path(os.environ["XDG_CACHE_HOME"]).expanduser() / "eam"
+    return Path.home() / ".cache" / "eam"
+
+
+def target_cache_path() -> Path:
+    return default_cache_dir() / "targets.json"
+
+
+def load_target_cache() -> dict[str, list[str]]:
+    cache_path = target_cache_path()
+    if not cache_path.exists():
+        return {}
+    try:
+        with cache_path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    targets = data.get("targets")
+    if not isinstance(targets, dict):
+        return {}
+    result: dict[str, list[str]] = {}
+    for server_name, items in targets.items():
+        if isinstance(server_name, str) and isinstance(items, list):
+            result[server_name] = [item for item in items if isinstance(item, str)]
+    return result
+
+
+def save_target_cache(targets: dict[str, list[str]]) -> None:
+    cache_dir = default_cache_dir()
+    cache_path = target_cache_path()
+    payload = {
+        "updated_at": int(time.time()),
+        "targets": targets,
+    }
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with cache_path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+    except OSError:
+        return
 
 
 def parse_scalar(raw: str) -> str | int:
@@ -241,6 +289,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_devices(args: argparse.Namespace) -> int:
     servers = load_servers(config_path(args.config))
     rows: list[list[str]] = []
+    cached_targets = load_target_cache()
 
     for server in servers:
         if args.server and args.server != server.name:
@@ -250,6 +299,9 @@ def cmd_devices(args: argparse.Namespace) -> int:
         except (RuntimeError, AdbTimeoutError) as exc:
             rows.append([server.name, "-", "error", str(exc)])
             continue
+        cached_targets[server.name] = [
+            f"{server.name}/{device['serial']}" for device in devices if device["state"] == "device"
+        ]
         if not devices:
             rows.append([server.name, "-", "empty", "-"])
             continue
@@ -260,6 +312,7 @@ def cmd_devices(args: argparse.Namespace) -> int:
     if not rows:
         print("no matching devices")
         return 0
+    save_target_cache(cached_targets)
     print_table(["SERVER", "SERIAL", "STATE", "MODEL"], rows)
     return 0
 
@@ -297,19 +350,14 @@ def complete_servers(path: Path) -> list[str]:
 
 
 def complete_targets(path: Path) -> list[str]:
-    items: list[str] = []
     try:
         servers = load_servers(path)
     except Exception:
-        return items
+        return []
+    cached_targets = load_target_cache()
+    items: list[str] = []
     for server in servers:
-        try:
-            devices = get_server_devices(server)
-        except Exception:
-            continue
-        for device in devices:
-            if device["state"] == "device":
-                items.append(f"{server.name}/{device['serial']}")
+        items.extend(cached_targets.get(server.name, []))
     return items
 
 
