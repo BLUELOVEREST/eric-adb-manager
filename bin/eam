@@ -1,0 +1,4 @@
+#!/usr/bin/env zsh
+
+SCRIPT_DIR=${0:A:h}
+exec python3 "$SCRIPT_DIR/../eam.py" "$@"

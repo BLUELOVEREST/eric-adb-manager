@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import yaml
+
+
+DEFAULT_CONFIG_CANDIDATES = [
+    Path(os.environ.get("EAM_CONFIG", "")) if os.environ.get("EAM_CONFIG") else None,
+    Path.cwd() / "config" / "servers.yaml",
+    Path.home() / ".config" / "eam" / "servers.yaml",
+]
+
+DEFAULT_CONFIG_CONTENT = """servers:
+  - name: signal
+    host: 10.95.64.240
+    port: 5037
+"""
+
+
+@dataclass
+class Server:
+    name: str
+    host: str
+    port: int = 5037
+
+
+class ConfigError(Exception):
+    pass
+
+
+def config_path(cli_value: str | None) -> Path:
+    if cli_value:
+        return Path(cli_value).expanduser()
+    for candidate in DEFAULT_CONFIG_CANDIDATES:
+        if candidate and candidate.exists():
+            return candidate
+    return Path.cwd() / "config" / "servers.yaml"
+
+
+def target_config_path(cli_value: str | None) -> Path:
+    if cli_value:
+        return Path(cli_value).expanduser()
+    return Path.home() / ".config" / "eam" / "servers.yaml"
+
+
+def load_servers(path: Path) -> list[Server]:
+    if not path.exists():
+        raise ConfigError(
+            f"config not found: {path}\n"
+            "create one from config/servers.example.yaml or pass --config"
+        )
+
+    with path.open("r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+
+    raw_servers = data.get("servers")
+    if not isinstance(raw_servers, list) or not raw_servers:
+        raise ConfigError(f"no servers defined in {path}")
+
+    servers = []
+    for item in raw_servers:
+        if not isinstance(item, dict):
+            raise ConfigError(f"invalid server entry in {path}: {item!r}")
+        try:
+            servers.append(
+                Server(
+                    name=str(item["name"]),
+                    host=str(item["host"]),
+                    port=int(item.get("port", 5037)),
+                )
+            )
+        except KeyError as exc:
+            raise ConfigError(f"missing key {exc} in {path}") from exc
+    return servers
+
+
+def server_map(servers: list[Server]) -> dict[str, Server]:
+    return {server.name: server for server in servers}
+
+
+def run_adb(server: Server, adb_args: list[str], serial: str | None = None) -> subprocess.CompletedProcess[str]:
+    cmd = ["adb", "-H", server.host, "-P", str(server.port)]
+    if serial:
+        cmd.extend(["-s", serial])
+    cmd.extend(adb_args)
+    return subprocess.run(cmd, text=True, capture_output=True)
+
+
+def parse_devices_output(text: str) -> list[dict[str, str]]:
+    devices: list[dict[str, str]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("List of devices attached"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        entry = {
+            "serial": parts[0],
+            "state": parts[1],
+            "model": "",
+            "device": "",
+            "transport_id": "",
+        }
+        for item in parts[2:]:
+            if ":" not in item:
+                continue
+            key, value = item.split(":", 1)
+            if key in entry:
+                entry[key] = value
+        devices.append(entry)
+    return devices
+
+
+def get_server_devices(server: Server) -> list[dict[str, str]]:
+    result = run_adb(server, ["devices", "-l"])
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"adb devices failed for {server.name}")
+    return parse_devices_output(result.stdout)
+
+
+def parse_target(target: str, servers_by_name: dict[str, Server]) -> tuple[Server, str]:
+    if "/" not in target:
+        raise ConfigError("target must be in the form server/serial")
+    server_name, serial = target.split("/", 1)
+    if not server_name or not serial:
+        raise ConfigError("target must be in the form server/serial")
+    server = servers_by_name.get(server_name)
+    if not server:
+        raise ConfigError(f"unknown server: {server_name}")
+    return server, serial
+
+
+def print_table(headers: list[str], rows: list[list[str]]) -> None:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, col in enumerate(row):
+            widths[index] = max(widths[index], len(col))
+
+    print("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    for row in rows:
+        print("  ".join(col.ljust(widths[index]) for index, col in enumerate(row)))
+
+
+def cmd_servers(args: argparse.Namespace) -> int:
+    servers = load_servers(config_path(args.config))
+    rows = [[server.name, server.host, str(server.port)] for server in servers]
+    print_table(["NAME", "HOST", "PORT"], rows)
+    return 0
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    path = target_config_path(args.config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.exists() and not args.force:
+        raise ConfigError(f"config already exists: {path} (use --force to overwrite)")
+
+    path.write_text(DEFAULT_CONFIG_CONTENT, encoding="utf-8")
+    print(f"initialized config: {path}")
+    return 0
+
+
+def cmd_devices(args: argparse.Namespace) -> int:
+    servers = load_servers(config_path(args.config))
+    rows: list[list[str]] = []
+
+    for server in servers:
+        if args.server and args.server != server.name:
+            continue
+        try:
+            devices = get_server_devices(server)
+        except RuntimeError as exc:
+            rows.append([server.name, "-", "error", str(exc)])
+            continue
+        if not devices:
+            rows.append([server.name, "-", "empty", "-"])
+            continue
+        for device in devices:
+            label = device["model"] or device["device"] or "-"
+            rows.append([server.name, device["serial"], device["state"], label])
+
+    if not rows:
+        print("no matching devices")
+        return 0
+    print_table(["SERVER", "SERIAL", "STATE", "MODEL"], rows)
+    return 0
+
+
+def cmd_shell(args: argparse.Namespace) -> int:
+    servers = load_servers(config_path(args.config))
+    server, serial = parse_target(args.target, server_map(servers))
+    result = run_adb(server, ["shell", *args.shell_command], serial=serial)
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    return result.returncode
+
+
+def cmd_push(args: argparse.Namespace) -> int:
+    servers = load_servers(config_path(args.config))
+    server, serial = parse_target(args.target, server_map(servers))
+    result = run_adb(server, ["push", args.local_path, args.remote_path], serial=serial)
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    return result.returncode
+
+
+def complete_servers(path: Path) -> list[str]:
+    try:
+        return [server.name for server in load_servers(path)]
+    except Exception:
+        return []
+
+
+def complete_targets(path: Path) -> list[str]:
+    items: list[str] = []
+    try:
+        servers = load_servers(path)
+    except Exception:
+        return items
+    for server in servers:
+        try:
+            devices = get_server_devices(server)
+        except Exception:
+            continue
+        for device in devices:
+            if device["state"] == "device":
+                items.append(f"{server.name}/{device['serial']}")
+    return items
+
+
+def cmd_internal_complete(args: argparse.Namespace) -> int:
+    cfg = config_path(args.config)
+    words = args.words
+    if not words:
+        for item in ["init", "servers", "devices", "shell", "push", "completion"]:
+            print(item)
+        return 0
+
+    current = words[-1]
+    previous = words[-2] if len(words) >= 2 else ""
+    command = words[0]
+
+    if len(words) == 1:
+        for item in ["init", "servers", "devices", "shell", "push", "completion"]:
+            if item.startswith(current):
+                print(item)
+        return 0
+
+    if command == "init":
+        for item in ["--force", "--config"]:
+            if item.startswith(current):
+                print(item)
+        return 0
+
+    if command == "servers":
+        for item in ["list"]:
+            if item.startswith(current):
+                print(item)
+        return 0
+
+    if command == "devices":
+        if previous == "--server" or (len(words) == 2 and not current.startswith("-")):
+            for item in complete_servers(cfg):
+                if item.startswith(current):
+                    print(item)
+            return 0
+        for item in ["--server"]:
+            if item.startswith(current):
+                print(item)
+        return 0
+
+    if command in {"shell", "push"}:
+        target_index = 1
+        if len(words) - 1 == target_index:
+            for item in complete_targets(cfg):
+                if item.startswith(current):
+                    print(item)
+            return 0
+        return 0
+
+    if command == "completion":
+        for item in ["zsh"]:
+            if item.startswith(current):
+                print(item)
+        return 0
+
+    return 0
+
+
+def cmd_completion_zsh(_: argparse.Namespace) -> int:
+    script = r"""#compdef eam.py eam
+
+_eam_complete() {
+  local -a completions
+  local -a args
+  local word
+
+  args=("${words[@]:1}")
+  word="${args[-1]}"
+
+  completions=("${(@f)$($words[1] __complete -- "${args[@]}" 2>/dev/null)}")
+  _describe 'values' completions
+}
+
+compdef _eam_complete eam.py
+compdef _eam_complete eam
+"""
+    print(script)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="eam", description="Remote adb server manager")
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+    init_parser = subparsers.add_parser("init", help="Initialize a config file")
+    init_parser.add_argument("--config", help="Config path to create")
+    init_parser.add_argument("--force", action="store_true", help="Overwrite an existing config file")
+    init_parser.set_defaults(func=cmd_init)
+
+    servers_parser = subparsers.add_parser("servers", help="List configured adb servers")
+    servers_parser.add_argument("action", choices=["list"])
+    servers_parser.add_argument("--config")
+    servers_parser.set_defaults(func=cmd_servers)
+
+    devices_parser = subparsers.add_parser("devices", help="List devices across servers")
+    devices_parser.add_argument("--server", help="Filter by server name")
+    devices_parser.add_argument("--config")
+    devices_parser.set_defaults(func=cmd_devices)
+
+    shell_parser = subparsers.add_parser("shell", help="Run adb shell on a target")
+    shell_parser.add_argument("target", help="Target in the form server/serial")
+    shell_parser.add_argument("shell_command", nargs=argparse.REMAINDER)
+    shell_parser.add_argument("--config")
+    shell_parser.set_defaults(func=cmd_shell)
+
+    push_parser = subparsers.add_parser("push", help="Push a file to a target")
+    push_parser.add_argument("target", help="Target in the form server/serial")
+    push_parser.add_argument("local_path")
+    push_parser.add_argument("remote_path")
+    push_parser.add_argument("--config")
+    push_parser.set_defaults(func=cmd_push)
+
+    completion_parser = subparsers.add_parser("completion", help="Generate shell completion")
+    completion_parser.add_argument("shell_name", choices=["zsh"])
+    completion_parser.add_argument("--config")
+    completion_parser.set_defaults(func=cmd_completion_zsh)
+
+    internal_complete = subparsers.add_parser("__complete")
+    internal_complete.add_argument("--config")
+    internal_complete.add_argument("separator", nargs="?")
+    internal_complete.add_argument("words", nargs=argparse.REMAINDER)
+    internal_complete.set_defaults(func=cmd_internal_complete)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if getattr(args, "subcommand", None) == "__complete" and args.separator == "--":
+        pass
+    elif getattr(args, "subcommand", None) == "__complete" and args.separator is not None:
+        args.words.insert(0, args.separator)
+
+    if args.subcommand == "servers" and args.action != "list":
+        raise SystemExit("unsupported servers action")
+    if args.subcommand == "shell" and not args.shell_command:
+        raise SystemExit("shell command is required")
+    if args.subcommand == "completion" and args.shell_name != "zsh":
+        raise SystemExit("unsupported completion shell")
+
+    try:
+        return args.func(args)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
