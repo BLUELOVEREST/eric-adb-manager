@@ -141,6 +141,14 @@ def run_adb(server: Server, adb_args: list[str], serial: str | None = None) -> s
     return subprocess.run(cmd, text=True, capture_output=True)
 
 
+def adb_command(server: Server, adb_args: list[str], serial: str | None = None) -> list[str]:
+    cmd = ["adb", "-H", server.host, "-P", str(server.port)]
+    if serial:
+        cmd.extend(["-s", serial])
+    cmd.extend(adb_args)
+    return cmd
+
+
 def parse_devices_output(text: str) -> list[dict[str, str]]:
     devices: list[dict[str, str]] = []
     for line in text.splitlines():
@@ -245,6 +253,9 @@ def cmd_devices(args: argparse.Namespace) -> int:
 def cmd_shell(args: argparse.Namespace) -> int:
     servers = load_servers(config_path(args.config))
     server, serial = parse_target(args.target, server_map(servers))
+    if not args.shell_command:
+        cmd = adb_command(server, ["shell"], serial=serial)
+        return subprocess.run(cmd).returncode
     result = run_adb(server, ["shell", *args.shell_command], serial=serial)
     if result.stdout:
         sys.stdout.write(result.stdout)
@@ -425,8 +436,6 @@ def main() -> int:
 
     if args.subcommand == "servers" and args.action != "list":
         raise SystemExit("unsupported servers action")
-    if args.subcommand == "shell" and not args.shell_command:
-        raise SystemExit("shell command is required")
     if args.subcommand == "completion" and args.shell_name != "zsh":
         raise SystemExit("unsupported completion shell")
 
