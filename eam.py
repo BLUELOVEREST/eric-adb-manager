@@ -13,6 +13,7 @@ DEFAULT_CONFIG_CANDIDATES = [
     Path.cwd() / "config" / "servers.yaml",
     Path.home() / ".config" / "eam" / "servers.yaml",
 ]
+DEFAULT_ADB_TIMEOUT = float(os.environ.get("EAM_ADB_TIMEOUT", "5"))
 
 DEFAULT_CONFIG_CONTENT = """servers:
   - name: signal
@@ -29,6 +30,10 @@ class Server:
 
 
 class ConfigError(Exception):
+    pass
+
+
+class AdbTimeoutError(RuntimeError):
     pass
 
 
@@ -133,12 +138,21 @@ def server_map(servers: list[Server]) -> dict[str, Server]:
     return {server.name: server for server in servers}
 
 
-def run_adb(server: Server, adb_args: list[str], serial: str | None = None) -> subprocess.CompletedProcess[str]:
+def run_adb(
+    server: Server,
+    adb_args: list[str],
+    serial: str | None = None,
+    timeout: float | None = DEFAULT_ADB_TIMEOUT,
+) -> subprocess.CompletedProcess[str]:
     cmd = ["adb", "-H", server.host, "-P", str(server.port)]
     if serial:
         cmd.extend(["-s", serial])
     cmd.extend(adb_args)
-    return subprocess.run(cmd, text=True, capture_output=True)
+    try:
+        return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        timeout_value = timeout if timeout is not None else "unknown"
+        raise AdbTimeoutError(f"adb command timed out after {timeout_value}s for {server.name}") from exc
 
 
 def adb_command(server: Server, adb_args: list[str], serial: str | None = None) -> list[str]:
@@ -233,7 +247,7 @@ def cmd_devices(args: argparse.Namespace) -> int:
             continue
         try:
             devices = get_server_devices(server)
-        except RuntimeError as exc:
+        except (RuntimeError, AdbTimeoutError) as exc:
             rows.append([server.name, "-", "error", str(exc)])
             continue
         if not devices:
