@@ -7,8 +7,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
-
 
 DEFAULT_CONFIG_CANDIDATES = [
     Path(os.environ.get("EAM_CONFIG", "")) if os.environ.get("EAM_CONFIG") else None,
@@ -49,6 +47,57 @@ def target_config_path(cli_value: str | None) -> Path:
     return Path.home() / ".config" / "eam" / "servers.yaml"
 
 
+def parse_scalar(raw: str) -> str | int:
+    value = raw.strip()
+    if not value:
+        return ""
+    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+        return value[1:-1]
+    if value.isdigit():
+        return int(value)
+    return value
+
+
+def parse_config(text: str, path: Path) -> dict[str, object]:
+    servers: list[dict[str, object]] = []
+    current: dict[str, object] | None = None
+    in_servers = False
+
+    for lineno, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+
+        stripped = line.lstrip()
+        if stripped == "servers:":
+            in_servers = True
+            continue
+
+        if not in_servers:
+            raise ConfigError(f"unsupported config format in {path}:{lineno}")
+
+        if stripped.startswith("- "):
+            current = {}
+            servers.append(current)
+            stripped = stripped[2:].strip()
+            if not stripped:
+                continue
+            if ":" not in stripped:
+                raise ConfigError(f"invalid server entry in {path}:{lineno}")
+            key, value = stripped.split(":", 1)
+            current[key.strip()] = parse_scalar(value)
+            continue
+
+        if current is None:
+            raise ConfigError(f"invalid server entry in {path}:{lineno}")
+        if ":" not in stripped:
+            raise ConfigError(f"invalid mapping in {path}:{lineno}")
+        key, value = stripped.split(":", 1)
+        current[key.strip()] = parse_scalar(value)
+
+    return {"servers": servers}
+
+
 def load_servers(path: Path) -> list[Server]:
     if not path.exists():
         raise ConfigError(
@@ -57,7 +106,7 @@ def load_servers(path: Path) -> list[Server]:
         )
 
     with path.open("r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or {}
+        data = parse_config(fh.read(), path)
 
     raw_servers = data.get("servers")
     if not isinstance(raw_servers, list) or not raw_servers:
