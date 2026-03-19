@@ -18,7 +18,7 @@ Options:
   --install-root PATH   Install source files to PATH, default: ~/.local/share/eam
   --bin-dir PATH        Link eam into PATH, default: ~/.local/bin
   --config PATH         Config path, default: ~/.config/eam/servers.yaml
-  --skip-shell          Do not modify ~/.zshrc
+  --skip-shell          Do not modify shell rc files
   --force-config        Reinitialize config if it already exists
   -h, --help            Show this help
 
@@ -34,24 +34,88 @@ require_cmd() {
   fi
 }
 
-append_zshrc() {
-  local zshrc="$HOME/.zshrc"
-  local marker="# eam completion"
-  local line='eval "$(eam completion zsh)"'
+detect_shell_rc() {
+  local shell_name
+  shell_name="$(basename "${SHELL:-}")"
 
-  if [[ ! -f "$zshrc" ]]; then
-    touch "$zshrc"
+  case "$shell_name" in
+    zsh)
+      printf '%s\n' "$HOME/.zshrc"
+      ;;
+    bash)
+      if [[ "$(uname -s)" == "Darwin" ]]; then
+        printf '%s\n' "$HOME/.bash_profile"
+      else
+        printf '%s\n' "$HOME/.bashrc"
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+prompt_yes_no() {
+  local prompt="$1"
+  local reply
+
+  if [[ ! -r /dev/tty ]]; then
+    return 1
   fi
 
-  if grep -Fq "$line" "$zshrc"; then
+  while true; do
+    printf '%s [y/N]: ' "$prompt" >/dev/tty
+    IFS= read -r reply </dev/tty || return 1
+    case "$reply" in
+      y|Y|yes|YES)
+        return 0
+        ;;
+      n|N|no|NO|"")
+        return 1
+        ;;
+    esac
+  done
+}
+
+ensure_line_in_file() {
+  local file="$1"
+  local line="$2"
+
+  if [[ ! -f "$file" ]]; then
+    touch "$file"
+  fi
+
+  if grep -Fqx "$line" "$file"; then
     return 0
   fi
 
-  {
-    echo
-    echo "$marker"
-    echo "$line"
-  } >>"$zshrc"
+  printf '%s\n' "$line" >>"$file"
+}
+
+configure_shell() {
+  local rc_file
+  local path_line="export PATH=\"$BIN_DIR:\$PATH\""
+  local completion_line='eval "$(eam completion zsh)"'
+
+  if ! rc_file="$(detect_shell_rc)"; then
+    echo "Skipping shell init: unsupported shell '${SHELL:-unknown}'"
+    return 0
+  fi
+
+  echo "Detected shell config: $rc_file"
+  if ! prompt_yes_no "Add PATH and eam completion to $rc_file?"; then
+    echo "Skipped shell config changes"
+    return 0
+  fi
+
+  ensure_line_in_file "$rc_file" ""
+  ensure_line_in_file "$rc_file" "# eam"
+  ensure_line_in_file "$rc_file" "$path_line"
+  if [[ "$(basename "${SHELL:-}")" == "zsh" ]]; then
+    ensure_line_in_file "$rc_file" "$completion_line"
+  fi
+
+  echo "Updated shell config: $rc_file"
 }
 
 download_archive() {
@@ -143,7 +207,7 @@ main() {
   fi
 
   if [[ $SKIP_SHELL -eq 0 ]]; then
-    append_zshrc
+    configure_shell
   fi
 
   cat <<EOF
