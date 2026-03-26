@@ -289,8 +289,9 @@ def complete_remote_paths(target: str, current_path: str, servers_by_name: dict[
         if remote_dir == "":
             remote_dir = "."
 
+    # Use ls -F so directories end with '/' in completion results.
     try:
-        result = run_adb(server, ["shell", "ls", "-1a", remote_dir], serial=serial, timeout=2)
+        result = run_adb(server, ["shell", "ls", "-1aF", remote_dir], serial=serial, timeout=2)
     except (RuntimeError, AdbTimeoutError):
         return []
     if result.returncode != 0:
@@ -298,12 +299,18 @@ def complete_remote_paths(target: str, current_path: str, servers_by_name: dict[
 
     items: list[str] = []
     for line in result.stdout.splitlines():
-        name = line.strip()
-        if not name or name in {".", ".."}:
+        raw_name = line.strip()
+        if not raw_name or raw_name in {".", "..", "./", "../"}:
             continue
-        if prefix and not name.startswith(prefix):
+
+        is_dir = raw_name.endswith("/")
+        clean_name = raw_name[:-1] if is_dir else raw_name
+        if prefix and not clean_name.startswith(prefix):
             continue
-        candidate = posixpath.join(remote_dir, name) if remote_dir != "." else name
+
+        candidate = posixpath.join(remote_dir, clean_name) if remote_dir != "." else clean_name
+        if is_dir:
+            candidate = f"{candidate}/"
         items.append(candidate)
     return items
 
@@ -541,9 +548,12 @@ def cmd_completion_zsh(_: argparse.Namespace) -> int:
 
 _eam_complete() {
   local -a completions
+  local -a dirs
+  local -a files
   local -a args
   local word
   local command
+  local item
 
   args=("${words[@]:1}")
   word="${args[-1]}"
@@ -564,7 +574,23 @@ _eam_complete() {
   fi
 
   completions=("${(@f)$($words[1] __complete -- "${args[@]}" 2>/dev/null)}")
-  _describe 'values' completions
+  dirs=()
+  files=()
+
+  for item in "${completions[@]}"; do
+    if [[ "$item" == */ ]]; then
+      dirs+=("$item")
+    else
+      files+=("$item")
+    fi
+  done
+
+  if (( ${#dirs[@]} )); then
+    compadd -Q -S '' -- "${dirs[@]}"
+  fi
+  if (( ${#files[@]} )); then
+    compadd -Q -- "${files[@]}"
+  fi
 }
 
 compdef _eam_complete eam.py
