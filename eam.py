@@ -289,9 +289,24 @@ def complete_remote_paths(target: str, current_path: str, servers_by_name: dict[
         if remote_dir == "":
             remote_dir = "."
 
-    # Use ls -F so directories end with '/' in completion results.
+    # Detect directories explicitly on the device instead of relying on ls -F.
+    shell_script = (
+        'cd "$1" || exit 1; '
+        'for name in .* *; do '
+        '[ "$name" = "." ] && continue; '
+        '[ "$name" = ".." ] && continue; '
+        '[ -e "$name" ] || continue; '
+        'if [ -d "$name" ]; then printf "%s\n" "$name/"; '
+        'else printf "%s\n" "$name"; fi; '
+        'done'
+    )
     try:
-        result = run_adb(server, ["shell", "ls", "-1aF", remote_dir], serial=serial, timeout=2)
+        result = run_adb(
+            server,
+            ["shell", "sh", "-c", shell_script, "sh", remote_dir],
+            serial=serial,
+            timeout=2,
+        )
     except (RuntimeError, AdbTimeoutError):
         return []
     if result.returncode != 0:
@@ -300,7 +315,7 @@ def complete_remote_paths(target: str, current_path: str, servers_by_name: dict[
     items: list[str] = []
     for line in result.stdout.splitlines():
         raw_name = line.strip()
-        if not raw_name or raw_name in {".", "..", "./", "../"}:
+        if not raw_name:
             continue
 
         is_dir = raw_name.endswith("/")
