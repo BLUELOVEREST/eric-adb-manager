@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import posixpath
 import subprocess
 import sys
 import time
@@ -98,6 +99,22 @@ def save_target_cache(targets: dict[str, list[str]]) -> None:
             json.dump(payload, fh)
     except OSError:
         return
+
+
+def refresh_target_cache(servers: list[Server], server_filter: str | None = None) -> dict[str, list[str]]:
+    cached_targets = load_target_cache()
+    for server in servers:
+        if server_filter and server.name != server_filter:
+            continue
+        try:
+            devices = get_server_devices(server)
+        except (RuntimeError, AdbTimeoutError):
+            continue
+        cached_targets[server.name] = [
+            f"{server.name}/{device['serial']}" for device in devices if device["state"] == "device"
+        ]
+    save_target_cache(cached_targets)
+    return cached_targets
 
 
 def parse_scalar(raw: str) -> str | int:
@@ -256,6 +273,41 @@ def parse_target(target: str, servers_by_name: dict[str, Server]) -> tuple[Serve
     return server, serial
 
 
+def complete_remote_paths(target: str, current_path: str, servers_by_name: dict[str, Server]) -> list[str]:
+    try:
+        server, serial = parse_target(target, servers_by_name)
+    except ConfigError:
+        return []
+
+    normalized = current_path or "."
+    if normalized.endswith("/"):
+        remote_dir = normalized.rstrip("/") or "/"
+        prefix = ""
+    else:
+        remote_dir = posixpath.dirname(normalized)
+        prefix = posixpath.basename(normalized)
+        if remote_dir == "":
+            remote_dir = "."
+
+    try:
+        result = run_adb(server, ["shell", "ls", "-1a", remote_dir], serial=serial, timeout=2)
+    except (RuntimeError, AdbTimeoutError):
+        return []
+    if result.returncode != 0:
+        return []
+
+    items: list[str] = []
+    for line in result.stdout.splitlines():
+        name = line.strip()
+        if not name or name in {".", ".."}:
+            continue
+        if prefix and not name.startswith(prefix):
+            continue
+        candidate = posixpath.join(remote_dir, name) if remote_dir != "." else name
+        items.append(candidate)
+    return items
+
+
 def print_table(headers: list[str], rows: list[list[str]]) -> None:
     widths = [len(header) for header in headers]
     for row in rows:
@@ -317,6 +369,21 @@ def cmd_devices(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_refresh(args: argparse.Namespace) -> int:
+    servers = load_servers(config_path(args.config))
+    cached_targets = refresh_target_cache(servers, server_filter=args.server)
+    rows: list[list[str]] = []
+    for server in servers:
+        if args.server and server.name != args.server:
+            continue
+        rows.append([server.name, str(len(cached_targets.get(server.name, [])))])
+    if not rows:
+        print("no matching servers")
+        return 0
+    print_table(["SERVER", "CACHED_TARGETS"], rows)
+    return 0
+
+
 def cmd_shell(args: argparse.Namespace) -> int:
     servers = load_servers(config_path(args.config))
     server, serial = parse_target(args.target, server_map(servers))
@@ -335,6 +402,17 @@ def cmd_push(args: argparse.Namespace) -> int:
     servers = load_servers(config_path(args.config))
     server, serial = parse_target(args.target, server_map(servers))
     result = run_adb(server, ["push", args.local_path, args.remote_path], serial=serial)
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    return result.returncode
+
+
+def cmd_pull(args: argparse.Namespace) -> int:
+    servers = load_servers(config_path(args.config))
+    server, serial = parse_target(args.target, server_map(servers))
+    result = run_adb(server, ["pull", args.remote_path, args.local_path], serial=serial)
     if result.stdout:
         sys.stdout.write(result.stdout)
     if result.stderr:
@@ -365,7 +443,7 @@ def cmd_internal_complete(args: argparse.Namespace) -> int:
     cfg = config_path(args.config)
     words = args.words
     if not words:
-        for item in ["init", "servers", "devices", "shell", "push", "completion"]:
+        for item in ["init", "refresh", "servers", "devices", "shell", "push", "pull", "completion"]:
             print(item)
         return 0
 
@@ -374,7 +452,7 @@ def cmd_internal_complete(args: argparse.Namespace) -> int:
     command = words[0]
 
     if len(words) == 1:
-        for item in ["init", "servers", "devices", "shell", "push", "completion"]:
+        for item in ["init", "refresh", "servers", "devices", "shell", "push", "pull", "completion"]:
             if item.startswith(current):
                 print(item)
         return 0
@@ -402,10 +480,48 @@ def cmd_internal_complete(args: argparse.Namespace) -> int:
                 print(item)
         return 0
 
-    if command in {"shell", "push"}:
-        target_index = 1
-        if len(words) - 1 == target_index:
+    if command == "refresh":
+        if previous == "--server" or (len(words) == 2 and not current.startswith("-")):
+            for item in complete_servers(cfg):
+                if item.startswith(current):
+                    print(item)
+            return 0
+        for item in ["--server"]:
+            if item.startswith(current):
+                print(item)
+        return 0
+
+    if command == "shell":
+        if len(words) == 2:
             for item in complete_targets(cfg):
+                if item.startswith(current):
+                    print(item)
+            return 0
+        return 0
+
+    if command == "push":
+        if len(words) == 2:
+            for item in complete_targets(cfg):
+                if item.startswith(current):
+                    print(item)
+            return 0
+        if len(words) == 4:
+            servers = load_servers(cfg)
+            for item in complete_remote_paths(words[1], current, server_map(servers)):
+                if item.startswith(current):
+                    print(item)
+            return 0
+        return 0
+
+    if command == "pull":
+        if len(words) == 2:
+            for item in complete_targets(cfg):
+                if item.startswith(current):
+                    print(item)
+            return 0
+        if len(words) == 3:
+            servers = load_servers(cfg)
+            for item in complete_remote_paths(words[1], current, server_map(servers)):
                 if item.startswith(current):
                     print(item)
             return 0
@@ -427,9 +543,25 @@ _eam_complete() {
   local -a completions
   local -a args
   local word
+  local command
 
   args=("${words[@]:1}")
   word="${args[-1]}"
+  command="${words[2]}"
+
+  if [[ "$command" == "push" ]]; then
+    if (( CURRENT == 4 )); then
+      _files
+      return
+    fi
+  fi
+
+  if [[ "$command" == "pull" ]]; then
+    if (( CURRENT == 5 )); then
+      _files
+      return
+    fi
+  fi
 
   completions=("${(@f)$($words[1] __complete -- "${args[@]}" 2>/dev/null)}")
   _describe 'values' completions
@@ -461,6 +593,11 @@ def build_parser() -> argparse.ArgumentParser:
     devices_parser.add_argument("--config")
     devices_parser.set_defaults(func=cmd_devices)
 
+    refresh_parser = subparsers.add_parser("refresh", help="Refresh cached device targets")
+    refresh_parser.add_argument("--server", help="Filter by server name")
+    refresh_parser.add_argument("--config")
+    refresh_parser.set_defaults(func=cmd_refresh)
+
     shell_parser = subparsers.add_parser("shell", help="Run adb shell on a target")
     shell_parser.add_argument("target", help="Target in the form server/serial")
     shell_parser.add_argument("shell_command", nargs=argparse.REMAINDER)
@@ -473,6 +610,13 @@ def build_parser() -> argparse.ArgumentParser:
     push_parser.add_argument("remote_path")
     push_parser.add_argument("--config")
     push_parser.set_defaults(func=cmd_push)
+
+    pull_parser = subparsers.add_parser("pull", help="Pull a file from a target")
+    pull_parser.add_argument("target", help="Target in the form server/serial")
+    pull_parser.add_argument("remote_path")
+    pull_parser.add_argument("local_path")
+    pull_parser.add_argument("--config")
+    pull_parser.set_defaults(func=cmd_pull)
 
     completion_parser = subparsers.add_parser("completion", help="Generate shell completion")
     completion_parser.add_argument("shell_name", choices=["zsh"])
