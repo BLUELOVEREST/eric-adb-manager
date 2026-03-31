@@ -594,11 +594,14 @@ def cmd_completion_zsh(_: argparse.Namespace) -> int:
 _eam_complete() {
   local -a completions
   local -a dirs
+  local -a dir_displays
   local -a files
+  local -a file_displays
   local -a args
   local word
   local command
   local item
+  local display
 
   args=("${words[@]:1}")
   word="${args[-1]}"
@@ -620,21 +623,27 @@ _eam_complete() {
 
   completions=("${(@f)$($words[1] __complete -- "${args[@]}" 2>/dev/null)}")
   dirs=()
+  dir_displays=()
   files=()
+  file_displays=()
 
   for item in "${completions[@]}"; do
     if [[ "$item" == */ ]]; then
       dirs+=("$item")
+      display="${${item%/}:t}/"
+      dir_displays+=("$display")
     else
       files+=("$item")
+      display="${item:t}"
+      file_displays+=("$display")
     fi
   done
 
   if (( ${#dirs[@]} )); then
-    compadd -Q -S '' -- "${dirs[@]}"
+    compadd -Q -S '' -d dir_displays -- "${dirs[@]}"
   fi
   if (( ${#files[@]} )); then
-    compadd -Q -- "${files[@]}"
+    compadd -Q -d file_displays -- "${files[@]}"
   fi
 }
 
