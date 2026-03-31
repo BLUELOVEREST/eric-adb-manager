@@ -88,6 +88,8 @@ The completion script dynamically completes:
   - `$EAM_CONFIG`
   - `./config/servers.yaml`
   - `~/.config/eam/servers.yaml`
+- Metadata-style adb commands use a 5 second default timeout and can be overridden with `$EAM_ADB_TIMEOUT`.
+- File transfers (`push` / `pull`) do not time out by default. Set `$EAM_TRANSFER_TIMEOUT` to a number of seconds if you want a limit, or `none` / `0` to disable it explicitly.
 - Completion calls back into `eam.py`, so remote target completion depends on the configured `adb server` being reachable.
 
 ## Uninstall

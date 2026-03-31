@@ -16,7 +16,22 @@ DEFAULT_CONFIG_CANDIDATES = [
     Path.cwd() / "config" / "servers.yaml",
     Path.home() / ".config" / "eam" / "servers.yaml",
 ]
-DEFAULT_ADB_TIMEOUT = float(os.environ.get("EAM_ADB_TIMEOUT", "5"))
+
+
+def parse_timeout_env(name: str, default: float | None) -> float | None:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+
+    value = raw_value.strip().lower()
+    if value in {"", "none", "0"}:
+        return None
+
+    return float(raw_value)
+
+
+DEFAULT_ADB_TIMEOUT = parse_timeout_env("EAM_ADB_TIMEOUT", 5.0)
+DEFAULT_TRANSFER_TIMEOUT = parse_timeout_env("EAM_TRANSFER_TIMEOUT", None)
 
 DEFAULT_CONFIG_CONTENT = """servers:
   - name: signal
@@ -423,7 +438,12 @@ def cmd_shell(args: argparse.Namespace) -> int:
 def cmd_push(args: argparse.Namespace) -> int:
     servers = load_servers(config_path(args.config))
     server, serial = parse_target(args.target, server_map(servers))
-    result = run_adb(server, ["push", args.local_path, args.remote_path], serial=serial)
+    result = run_adb(
+        server,
+        ["push", args.local_path, args.remote_path],
+        serial=serial,
+        timeout=DEFAULT_TRANSFER_TIMEOUT,
+    )
     if result.stdout:
         sys.stdout.write(result.stdout)
     if result.stderr:
@@ -434,7 +454,12 @@ def cmd_push(args: argparse.Namespace) -> int:
 def cmd_pull(args: argparse.Namespace) -> int:
     servers = load_servers(config_path(args.config))
     server, serial = parse_target(args.target, server_map(servers))
-    result = run_adb(server, ["pull", args.remote_path, args.local_path], serial=serial)
+    result = run_adb(
+        server,
+        ["pull", args.remote_path, args.local_path],
+        serial=serial,
+        timeout=DEFAULT_TRANSFER_TIMEOUT,
+    )
     if result.stdout:
         sys.stdout.write(result.stdout)
     if result.stderr:
@@ -691,6 +716,9 @@ def main() -> int:
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except AdbTimeoutError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130
