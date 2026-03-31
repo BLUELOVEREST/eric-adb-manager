@@ -32,6 +32,7 @@ def parse_timeout_env(name: str, default: float | None) -> float | None:
 
 DEFAULT_ADB_TIMEOUT = parse_timeout_env("EAM_ADB_TIMEOUT", 5.0)
 DEFAULT_TRANSFER_TIMEOUT = parse_timeout_env("EAM_TRANSFER_TIMEOUT", None)
+DEFAULT_COMPLETION_TIMEOUT = parse_timeout_env("EAM_COMPLETION_TIMEOUT", 5.0)
 
 DEFAULT_CONFIG_CONTENT = """servers:
   - name: signal
@@ -288,6 +289,10 @@ def parse_target(target: str, servers_by_name: dict[str, Server]) -> tuple[Serve
     return server, serial
 
 
+def shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
 def complete_remote_paths(target: str, current_path: str, servers_by_name: dict[str, Server]) -> list[str]:
     try:
         server, serial = parse_target(target, servers_by_name)
@@ -306,7 +311,7 @@ def complete_remote_paths(target: str, current_path: str, servers_by_name: dict[
 
     # Detect directories explicitly on the device instead of relying on ls -F.
     shell_script = (
-        'cd "$1" || exit 1; '
+        f"cd {shell_quote(remote_dir)} || exit 1; "
         'for name in .* *; do '
         '[ "$name" = "." ] && continue; '
         '[ "$name" = ".." ] && continue; '
@@ -318,9 +323,9 @@ def complete_remote_paths(target: str, current_path: str, servers_by_name: dict[
     try:
         result = run_adb(
             server,
-            ["shell", "sh", "-c", shell_script, "sh", remote_dir],
+            ["shell", shell_script],
             serial=serial,
-            timeout=2,
+            timeout=DEFAULT_COMPLETION_TIMEOUT,
         )
     except (RuntimeError, AdbTimeoutError):
         return []
