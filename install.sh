@@ -42,13 +42,6 @@ detect_shell_rc() {
     zsh)
       printf '%s\n' "$HOME/.zshrc"
       ;;
-    bash)
-      if [[ "$(uname -s)" == "Darwin" ]]; then
-        printf '%s\n' "$HOME/.bash_profile"
-      else
-        printf '%s\n' "$HOME/.bashrc"
-      fi
-      ;;
     *)
       return 1
       ;;
@@ -94,28 +87,52 @@ ensure_line_in_file() {
 
 configure_shell() {
   local rc_file
-  local path_line="export PATH=\"$BIN_DIR:\$PATH\""
+  local path_line='export PATH="$HOME/.local/bin:$PATH"'
   local completion_line='eval "$(eam completion zsh)"'
+  local needs_path=0
+  local needs_completion=0
 
   if ! rc_file="$(detect_shell_rc)"; then
-    echo "Skipping shell init: unsupported shell '${SHELL:-unknown}'"
+    echo "Skipping shell init: only zsh is supported for automatic setup"
     return 0
   fi
 
-  echo "Detected shell config: $rc_file"
-  if ! prompt_yes_no "Add PATH and eam completion to $rc_file?"; then
-    echo "Skipped shell config changes"
+  if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    needs_path=1
+  fi
+
+  if [[ ! -f "$rc_file" ]] || ! grep -Fqx "$completion_line" "$rc_file"; then
+    needs_completion=1
+  fi
+
+  if [[ $needs_path -eq 0 && $needs_completion -eq 0 ]]; then
+    echo "zsh already configured: $rc_file"
     return 0
   fi
 
-  ensure_line_in_file "$rc_file" ""
-  ensure_line_in_file "$rc_file" "# eam"
-  ensure_line_in_file "$rc_file" "$path_line"
-  if [[ "$(basename "${SHELL:-}")" == "zsh" ]]; then
-    ensure_line_in_file "$rc_file" "$completion_line"
+  echo "Detected zsh config: $rc_file"
+
+  if [[ $needs_path -eq 1 ]]; then
+    if prompt_yes_no "PATH does not include $BIN_DIR. Add it to $rc_file?"; then
+      ensure_line_in_file "$rc_file" ""
+      ensure_line_in_file "$rc_file" "# eam"
+      ensure_line_in_file "$rc_file" "$path_line"
+      echo "Added PATH setup to $rc_file"
+    else
+      echo "Skipped PATH setup"
+    fi
   fi
 
-  echo "Updated shell config: $rc_file"
+  if [[ $needs_completion -eq 1 ]]; then
+    if prompt_yes_no "Add eam zsh completion to $rc_file?"; then
+      ensure_line_in_file "$rc_file" ""
+      ensure_line_in_file "$rc_file" "# eam"
+      ensure_line_in_file "$rc_file" "$completion_line"
+      echo "Added completion setup to $rc_file"
+    else
+      echo "Skipped completion setup"
+    fi
+  fi
 }
 
 download_archive() {

@@ -2,6 +2,11 @@ servers:
   - name: signal
     host: 10.95.64.240
     port: 5037
+    zsh:
+      local_dir: ./zsh-runtime
+      remote_dir: /data/local/tmp/eam/zsh-runtime
+      work_dir: /data/local/zhangzhicheng
+      home_dir: /data/local/zhangzhicheng
 
   - name: lab-a
     host: 10.95.64.241

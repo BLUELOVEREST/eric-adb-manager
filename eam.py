@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import posixpath
+import shlex
 import subprocess
 import sys
 import time
@@ -16,8 +17,6 @@ DEFAULT_CONFIG_CANDIDATES = [
     Path.cwd() / "config" / "servers.yaml",
     Path.home() / ".config" / "eam" / "servers.yaml",
 ]
-
-
 def parse_timeout_env(name: str, default: float | None) -> float | None:
     raw_value = os.environ.get(name)
     if raw_value is None:
@@ -33,11 +32,19 @@ def parse_timeout_env(name: str, default: float | None) -> float | None:
 DEFAULT_ADB_TIMEOUT = parse_timeout_env("EAM_ADB_TIMEOUT", 5.0)
 DEFAULT_TRANSFER_TIMEOUT = parse_timeout_env("EAM_TRANSFER_TIMEOUT", None)
 DEFAULT_COMPLETION_TIMEOUT = parse_timeout_env("EAM_COMPLETION_TIMEOUT", 5.0)
+DEFAULT_ZSH_REMOTE_DIR = os.environ.get("EAM_ZSH_REMOTE_DIR", "/data/local/tmp/eam/zsh-runtime")
+DEFAULT_ZSH_HOME_DIR = os.environ.get("EAM_ZSH_HOME_DIR")
+DEFAULT_ZSH_WORK_DIR = os.environ.get("EAM_ZSH_WORK_DIR")
 
 DEFAULT_CONFIG_CONTENT = """servers:
   - name: signal
     host: 10.95.64.240
     port: 5037
+    zsh:
+      local_dir: ./zsh-runtime
+      remote_dir: /data/local/tmp/eam/zsh-runtime
+      work_dir: /data/local/zhangzhicheng
+      home_dir: /data/local/zhangzhicheng
 """
 
 
@@ -46,6 +53,10 @@ class Server:
     name: str
     host: str
     port: int = 5037
+    zsh_local_dir: str | None = None
+    zsh_remote_dir: str | None = None
+    zsh_work_dir: str | None = None
+    zsh_home_dir: str | None = None
 
 
 class ConfigError(Exception):
@@ -54,6 +65,15 @@ class ConfigError(Exception):
 
 class AdbTimeoutError(RuntimeError):
     pass
+
+
+def default_zsh_local_dir() -> Path:
+    if os.environ.get("EAM_ZSH_RUNTIME"):
+        return Path(os.environ["EAM_ZSH_RUNTIME"]).expanduser()
+    cwd_runtime = Path.cwd() / "zsh-runtime"
+    if cwd_runtime.exists():
+        return cwd_runtime
+    return Path(__file__).resolve().parent / "zsh-runtime"
 
 
 def config_path(cli_value: str | None) -> Path:
@@ -147,6 +167,7 @@ def parse_scalar(raw: str) -> str | int:
 def parse_config(text: str, path: Path) -> dict[str, object]:
     servers: list[dict[str, object]] = []
     current: dict[str, object] | None = None
+    current_nested: dict[str, object] | None = None
     in_servers = False
 
     for lineno, raw_line in enumerate(text.splitlines(), start=1):
@@ -155,6 +176,7 @@ def parse_config(text: str, path: Path) -> dict[str, object]:
             continue
 
         stripped = line.lstrip()
+        indent = len(line) - len(stripped)
         if stripped == "servers:":
             in_servers = True
             continue
@@ -164,6 +186,7 @@ def parse_config(text: str, path: Path) -> dict[str, object]:
 
         if stripped.startswith("- "):
             current = {}
+            current_nested = None
             servers.append(current)
             stripped = stripped[2:].strip()
             if not stripped:
@@ -179,7 +202,18 @@ def parse_config(text: str, path: Path) -> dict[str, object]:
         if ":" not in stripped:
             raise ConfigError(f"invalid mapping in {path}:{lineno}")
         key, value = stripped.split(":", 1)
-        current[key.strip()] = parse_scalar(value)
+        key = key.strip()
+        value = value.strip()
+        if value == "":
+            nested: dict[str, object] = {}
+            current[key] = nested
+            current_nested = nested
+            continue
+        if indent >= 4 and current_nested is not None:
+            current_nested[key] = parse_scalar(value)
+            continue
+        current_nested = None
+        current[key] = parse_scalar(value)
 
     return {"servers": servers}
 
@@ -202,12 +236,21 @@ def load_servers(path: Path) -> list[Server]:
     for item in raw_servers:
         if not isinstance(item, dict):
             raise ConfigError(f"invalid server entry in {path}: {item!r}")
+        zsh_config = item.get("zsh", {})
+        if zsh_config is None:
+            zsh_config = {}
+        if not isinstance(zsh_config, dict):
+            raise ConfigError(f"invalid zsh config in {path}: {zsh_config!r}")
         try:
             servers.append(
                 Server(
                     name=str(item["name"]),
                     host=str(item["host"]),
                     port=int(item.get("port", 5037)),
+                    zsh_local_dir=str(zsh_config["local_dir"]) if "local_dir" in zsh_config else None,
+                    zsh_remote_dir=str(zsh_config["remote_dir"]) if "remote_dir" in zsh_config else None,
+                    zsh_work_dir=str(zsh_config["work_dir"]) if "work_dir" in zsh_config else None,
+                    zsh_home_dir=str(zsh_config["home_dir"]) if "home_dir" in zsh_config else None,
                 )
             )
         except KeyError as exc:
@@ -242,6 +285,10 @@ def adb_command(server: Server, adb_args: list[str], serial: str | None = None) 
         cmd.extend(["-s", serial])
     cmd.extend(adb_args)
     return cmd
+
+
+def run_adb_interactive(server: Server, adb_args: list[str], serial: str | None = None) -> int:
+    return subprocess.run(adb_command(server, adb_args, serial=serial)).returncode
 
 
 def parse_devices_output(text: str) -> list[dict[str, str]]:
@@ -472,6 +519,92 @@ def cmd_pull(args: argparse.Namespace) -> int:
     return result.returncode
 
 
+def install_zsh_runtime(server: Server, serial: str, local_dir: Path, remote_dir: str) -> int:
+    local_dir = local_dir.expanduser()
+    if not local_dir.is_dir():
+        print(f"error: zsh runtime directory not found: {local_dir}", file=sys.stderr)
+        return 2
+    start_script = local_dir / "bin" / "start-zsh.sh"
+    if not start_script.is_file():
+        print(f"error: start script not found: {start_script}", file=sys.stderr)
+        return 2
+
+    remote_dir = remote_dir.rstrip("/")
+    result = run_adb(server, ["shell", "mkdir", "-p", remote_dir], serial=serial)
+    if result.returncode != 0:
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+        return result.returncode
+
+    source = str(local_dir) + os.sep + "."
+    result = run_adb(server, ["push", source, remote_dir + "/"], serial=serial, timeout=None)
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    if result.returncode != 0:
+        return result.returncode
+
+    result = run_adb(server, ["shell", "chmod", "-R", "755", posixpath.join(remote_dir, "bin")], serial=serial)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    return result.returncode
+
+
+def start_zsh_runtime(
+    server: Server,
+    serial: str,
+    remote_dir: str,
+    work_dir: str | None = None,
+    home_dir: str | None = None,
+) -> int:
+    remote_dir = remote_dir.rstrip("/")
+    start_script = posixpath.join(remote_dir, "bin", "start-zsh.sh")
+    check = run_adb(
+        server,
+        ["shell", "test", "-f", start_script],
+        serial=serial,
+    )
+    if check.returncode != 0:
+        print(
+            f"error: zsh runtime is not installed at {remote_dir}; run `eam zsh-install` first",
+            file=sys.stderr,
+        )
+        return check.returncode
+
+    work_dir = (work_dir or remote_dir).rstrip("/") or "/"
+    env_prefix = f"ZSH_HOME_DIR={shlex.quote(home_dir)} " if home_dir else ""
+    shell_command = (
+        f"mkdir -p {shlex.quote(work_dir)}"
+        f"{f' {shlex.quote(home_dir)}' if home_dir else ''}"
+        f" && cd {shlex.quote(work_dir)}"
+        f" && exec {env_prefix}{shlex.quote(start_script)}"
+    )
+    return run_adb_interactive(server, ["shell", shell_command], serial=serial)
+
+
+def cmd_zsh_install(args: argparse.Namespace) -> int:
+    servers = load_servers(config_path(args.config))
+    server, serial = parse_target(args.target, server_map(servers))
+    local_dir = args.local_dir or server.zsh_local_dir or str(default_zsh_local_dir())
+    remote_dir = args.remote_dir or server.zsh_remote_dir or DEFAULT_ZSH_REMOTE_DIR
+    return install_zsh_runtime(server, serial, Path(local_dir), remote_dir)
+
+
+def cmd_zsh(args: argparse.Namespace) -> int:
+    servers = load_servers(config_path(args.config))
+    server, serial = parse_target(args.target, server_map(servers))
+    local_dir = args.local_dir or server.zsh_local_dir or str(default_zsh_local_dir())
+    remote_dir = args.remote_dir or server.zsh_remote_dir or DEFAULT_ZSH_REMOTE_DIR
+    work_dir = args.work_dir or server.zsh_work_dir or DEFAULT_ZSH_WORK_DIR
+    home_dir = args.home_dir or server.zsh_home_dir or DEFAULT_ZSH_HOME_DIR
+    if args.install:
+        result = install_zsh_runtime(server, serial, Path(local_dir), remote_dir)
+        if result != 0:
+            return result
+    return start_zsh_runtime(server, serial, remote_dir, work_dir=work_dir, home_dir=home_dir)
+
+
 def complete_servers(path: Path) -> list[str]:
     try:
         return [server.name for server in load_servers(path)]
@@ -495,7 +628,7 @@ def cmd_internal_complete(args: argparse.Namespace) -> int:
     cfg = config_path(args.config)
     words = args.words
     if not words:
-        for item in ["init", "refresh", "servers", "devices", "shell", "push", "pull", "completion"]:
+        for item in ["init", "refresh", "servers", "devices", "shell", "push", "pull", "zsh", "zsh-install", "completion"]:
             print(item)
         return 0
 
@@ -504,7 +637,7 @@ def cmd_internal_complete(args: argparse.Namespace) -> int:
     command = words[0]
 
     if len(words) == 1:
-        for item in ["init", "refresh", "servers", "devices", "shell", "push", "pull", "completion"]:
+        for item in ["init", "refresh", "servers", "devices", "shell", "push", "pull", "zsh", "zsh-install", "completion"]:
             if item.startswith(current):
                 print(item)
         return 0
@@ -579,6 +712,22 @@ def cmd_internal_complete(args: argparse.Namespace) -> int:
             return 0
         return 0
 
+    if command in {"zsh", "zsh-install"}:
+        if len(words) == 2:
+            for item in complete_targets(cfg):
+                if item.startswith(current):
+                    print(item)
+            return 0
+        if previous == "--local-dir":
+            return 0
+        options = ["--local-dir", "--remote-dir"]
+        if command == "zsh":
+            options = ["--install", "--home-dir", "--work-dir", *options]
+        for item in options:
+            if item.startswith(current):
+                print(item)
+        return 0
+
     if command == "completion":
         for item in ["zsh"]:
             if item.startswith(current):
@@ -601,11 +750,12 @@ _eam_complete() {
   local word
   local command
   local item
+  local ret=1
   local display
 
   args=("${words[@]:1}")
   word="${args[-1]}"
-  command="${words[2]}"
+  command="${words[2]:-}"
 
   if [[ "$command" == "push" ]]; then
     if (( CURRENT == 4 )); then
@@ -621,6 +771,13 @@ _eam_complete() {
     fi
   fi
 
+  if [[ "$command" == "zsh" || "$command" == "zsh-install" ]]; then
+    if [[ "${words[CURRENT-1]}" == "--local-dir" ]]; then
+      _files -/
+      return
+    fi
+  fi
+
   completions=("${(@f)$($words[1] __complete -- "${args[@]}" 2>/dev/null)}")
   dirs=()
   dir_displays=()
@@ -628,6 +785,7 @@ _eam_complete() {
   file_displays=()
 
   for item in "${completions[@]}"; do
+    [[ -z "$item" ]] && continue
     if [[ "$item" == */ ]]; then
       dirs+=("$item")
       display="${${item%/}:t}/"
@@ -640,11 +798,13 @@ _eam_complete() {
   done
 
   if (( ${#dirs[@]} )); then
-    compadd -Q -S '' -d dir_displays -- "${dirs[@]}"
+    compadd -Q -S '' -d dir_displays -- "${dirs[@]}" && ret=0
   fi
   if (( ${#files[@]} )); then
-    compadd -Q -d file_displays -- "${files[@]}"
+    compadd -Q -d file_displays -- "${files[@]}" && ret=0
   fi
+
+  return ret
 }
 
 compdef _eam_complete eam.py
@@ -697,6 +857,23 @@ def build_parser() -> argparse.ArgumentParser:
     pull_parser.add_argument("local_path")
     pull_parser.add_argument("--config")
     pull_parser.set_defaults(func=cmd_pull)
+
+    zsh_parser = subparsers.add_parser("zsh", help="Start zsh-runtime on a target")
+    zsh_parser.add_argument("target", help="Target in the form server/serial")
+    zsh_parser.add_argument("--install", action="store_true", help="Install zsh-runtime before starting it")
+    zsh_parser.add_argument("--local-dir", help="Local zsh-runtime directory")
+    zsh_parser.add_argument("--remote-dir", help="Remote zsh-runtime directory")
+    zsh_parser.add_argument("--work-dir", help="Remote working directory after zsh starts")
+    zsh_parser.add_argument("--home-dir", help="Remote HOME directory for zsh")
+    zsh_parser.add_argument("--config")
+    zsh_parser.set_defaults(func=cmd_zsh)
+
+    zsh_install_parser = subparsers.add_parser("zsh-install", help="Install zsh-runtime on a target")
+    zsh_install_parser.add_argument("target", help="Target in the form server/serial")
+    zsh_install_parser.add_argument("--local-dir", help="Local zsh-runtime directory")
+    zsh_install_parser.add_argument("--remote-dir", help="Remote zsh-runtime directory")
+    zsh_install_parser.add_argument("--config")
+    zsh_install_parser.set_defaults(func=cmd_zsh_install)
 
     completion_parser = subparsers.add_parser("completion", help="Generate shell completion")
     completion_parser.add_argument("shell_name", choices=["zsh"])
